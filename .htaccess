@@ -1,0 +1,14 @@
+# Enable the Rewrite Engine
+RewriteEngine On
+
+# Define the base directory
+RewriteBase /course-service/
+
+# Check if the requested file/path actually exists as a physical file on the server
+RewriteCond %{REQUEST_FILENAME} !-f
+
+# Check if the requested path actually exists as a physical directory on the server
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# If neither a file nor a directory exists, then internally rewrite the request to be handled by index.php
+RewriteRule ^ index.php [L]
