@@ -14,11 +14,10 @@ define('DB_NAME', 'course_db');
 $base_uri = '/api/v1';
 
 // 2. SET HEADERS
-// Allow cross-origin requests (crucial for microservices and frontend interaction)
 header('Access-Control-Allow-Origin: *');
 header('Content-Type: application/json');
 
-// Handle pre-flight OPTIONS requests often sent by browsers/Postman
+// Handle pre-flight OPTIONS requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
     header('Access-Control-Allow-Headers: Content-Type, Authorization');
@@ -38,68 +37,76 @@ if ($conn->connect_error) {
 
 // 4. ROUTING LOGIC
 $request_method = $_SERVER['REQUEST_METHOD'];
-// Get the requested URI path
 $uri = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
 
-// Remove the base path (/course-service/api/v1)
-$base_path = 'course-service/api/v1';
-if (strpos($uri, $base_path) === 0) {
-    $uri = substr($uri, strlen($base_path));
+// Extract resource and parameters from URI
+// Expected format: /course-service/api/v1/courses or /course-service/api/v1/courses/123
+// We need to get everything after /api/v1/
+$parts = explode('/', $uri);
+
+// Find the position of 'api' in the parts
+$api_index = array_search('api', $parts);
+if ($api_index !== false && isset($parts[$api_index + 1]) && $parts[$api_index + 1] === 'v1') {
+    // Extract everything after 'v1'
+    $resource_parts = array_slice($parts, $api_index + 2);
+    $resource_parts = array_values(array_filter($resource_parts)); // Remove empty values
+} else {
+    $resource_parts = [];
 }
 
-$uri = trim($uri, '/');
-$uri_segments = array_filter(explode('/', $uri));
-$uri_segments = array_values($uri_segments);
-
-// Determine the primary resource (e.g., 'courses', 'schedules')
-$resource = $uri_segments[0] ?? '';
-$id = $uri_segments[1] ?? null;
+$resource = $resource_parts[0] ?? '';
+$id = $resource_parts[1] ?? null;
+$sub_resource = $resource_parts[2] ?? null;
 
 
 // ===============================================
-// RESOURCE: /courses (tbl_courses)
+// ROUTING SECTION
 // ===============================================
 
 if ($resource === 'courses') {
-    if ($request_method === 'GET') {
-        // GET /courses -> Get all courses
-        if ($id === null) {
-            handle_get_all_courses($conn);
-        } 
-        // GET /courses/{id} -> Get specific course
-        else {
-            handle_get_single_course($conn, $id);
+    
+    // Endpoint: /courses/{user_id}/schedules
+    if ($id !== null && $sub_resource === 'schedules') {
+        if ($request_method === 'GET') {
+            handle_get_user_schedule($conn, $id);
+        } else if ($request_method === 'POST') {
+            handle_create_schedule($conn, $id); // ID is the user_id here
+        } else {
+            http_response_code(405);
+            echo json_encode(["error" => "Method not allowed for /courses/{user_id}/schedules"]);
         }
-    } 
-    
-    else if ($request_method === 'POST') {
-        // POST /courses -> Create a new course
-        handle_create_course($conn);
-    }
-    
-    // --- Placeholder for other methods ---
-    
-    else if ($request_method === 'PUT' && $id !== null) {
-        // PUT /courses/{id} -> Update a course
-        http_response_code(501); // Not Implemented
-        echo json_encode(["message" => "PUT /courses/{id} not yet implemented."]);
-    }
-    
-    else if ($request_method === 'DELETE' && $id !== null) {
-        // DELETE /courses/{id} -> Delete a course
-        http_response_code(501); // Not Implemented
-        echo json_encode(["message" => "DELETE /courses/{id} not yet implemented."]);
     }
 
-} 
+    // Endpoint: /courses, /courses/{course_id}
+    else {
+        if ($request_method === 'GET') {
+            if ($id === null) {
+                // GET /courses OR GET /courses?department={name}
+                handle_get_all_courses($conn);
+            } else {
+                // GET /courses/{course_id}
+                handle_get_single_course($conn, $id);
+            }
+        } 
+        
+        else if ($request_method === 'POST') {
+            // POST /courses -> Create a new course
+            handle_create_course($conn);
+        }
+        
+        else if ($request_method === 'PUT' && $id !== null) {
+            // PUT /courses/{course_id} -> Update a course
+            handle_update_course($conn, $id);
+        }
+        
+        else if ($request_method === 'DELETE' && $id !== null) {
+            // DELETE /courses/{course_id} -> Delete a course
+            http_response_code(501); // Not Implemented
+            echo json_encode(["message" => "DELETE /courses/{id} not yet implemented."]);
+        }
+    }
 
-// --- Placeholder for other resources ---
-else if ($resource === 'schedules') {
-    http_response_code(501);
-    echo json_encode(["message" => "Schedule resource routing not yet implemented."]);
-}
-
-else {
+} else {
     // If no resource matches
     http_response_code(404);
     echo json_encode(["error" => "Resource not found"]);
@@ -113,12 +120,29 @@ $conn->close();
 // ===============================================
 
 /**
- * Handles GET /courses
- * Fetches all courses from tbl_courses.
+ * Handles GET /courses and GET /courses?department={name}
  */
 function handle_get_all_courses($conn) {
+    // Check for the 'department' query parameter
+    $department = $_GET['department'] ?? null;
     $sql = "SELECT course_id, course_name, units, departments FROM tbl_courses";
-    $result = $conn->query($sql);
+    $params = [];
+    $types = '';
+
+    if ($department) {
+        $sql .= " WHERE departments = ?";
+        $params[] = $department;
+        $types .= 's';
+    }
+
+    $stmt = $conn->prepare($sql);
+    
+    if ($department) {
+        $stmt->bind_param($types, ...$params);
+    }
+    
+    $stmt->execute();
+    $result = $stmt->get_result();
     
     if ($result) {
         $courses = [];
@@ -135,7 +159,6 @@ function handle_get_all_courses($conn) {
 
 /**
  * Handles GET /courses/{id}
- * Fetches a single course from tbl_courses.
  */
 function handle_get_single_course($conn, $id) {
     $stmt = $conn->prepare("SELECT course_id, course_name, units, departments FROM tbl_courses WHERE course_id = ?");
@@ -159,10 +182,8 @@ function handle_get_single_course($conn, $id) {
  * Creates a new course in tbl_courses.
  */
 function handle_create_course($conn) {
-    // Read JSON data from the request body
     $data = json_decode(file_get_contents("php://input"), true);
 
-    // Basic input validation
     $course_name = $data['course_name'] ?? null;
     $units = $data['units'] ?? null;
     $departments = $data['departments'] ?? null;
@@ -173,9 +194,8 @@ function handle_create_course($conn) {
         return;
     }
 
-    // Use prepared statements to prevent SQL injection (ALWAYS use this!)
     $stmt = $conn->prepare("INSERT INTO tbl_courses (course_name, units, departments) VALUES (?, ?, ?)");
-    $stmt->bind_param("sis", $course_name, $units, $departments); // s=string, i=integer
+    $stmt->bind_param("sis", $course_name, $units, $departments);
 
     if ($stmt->execute()) {
         http_response_code(201); // 201 Created
@@ -185,8 +205,183 @@ function handle_create_course($conn) {
             "course_name" => $course_name
         ]);
     } else {
-        http_response_code(500); // Internal Server Error
+        http_response_code(500);
         echo json_encode(["error" => "Failed to create course: " . $stmt->error]);
+    }
+}
+
+/**
+ * Handles PUT /courses/{course_id}
+ * Updates an existing course in tbl_courses.
+ */
+function handle_update_course($conn, $course_id) {
+    $data = json_decode(file_get_contents("php://input"), true);
+
+    if (empty($data)) {
+        http_response_code(400);
+        echo json_encode(["error" => "No data provided for update."]);
+        return;
+    }
+
+    // Build the dynamic update query
+    $set_clauses = [];
+    $params = [];
+    $types = '';
+
+    if (isset($data['course_name'])) {
+        $set_clauses[] = "course_name = ?";
+        $params[] = $data['course_name'];
+        $types .= 's';
+    }
+    if (isset($data['units']) && is_numeric($data['units'])) {
+        $set_clauses[] = "units = ?";
+        $params[] = $data['units'];
+        $types .= 'i';
+    }
+    if (isset($data['departments'])) {
+        $set_clauses[] = "departments = ?";
+        $params[] = $data['departments'];
+        $types .= 's';
+    }
+
+    if (empty($set_clauses)) {
+        http_response_code(400);
+        echo json_encode(["error" => "No valid fields to update (requires course_name, units, or departments)."]);
+        return;
+    }
+
+    $sql = "UPDATE tbl_courses SET " . implode(', ', $set_clauses) . " WHERE course_id = ?";
+    
+    // Add the course_id to the parameters and its type (integer)
+    $params[] = $course_id;
+    $types .= 'i';
+
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param($types, ...$params);
+
+    if ($stmt->execute()) {
+        if ($stmt->affected_rows === 0) {
+            // Could be 404 (not found) or 200 (no changes needed)
+            handle_get_single_course($conn, $course_id); // Check if it exists before saying 200/404
+            return;
+        }
+        http_response_code(200); // OK
+        echo json_encode([
+            "message" => "Course ID $course_id updated successfully."
+        ]);
+    } else {
+        http_response_code(500);
+        echo json_encode(["error" => "Failed to update course: " . $stmt->error]);
+    }
+}
+
+
+/**
+ * Handles GET /courses/{user_id}/schedules
+ */
+function handle_get_user_schedule($conn, $user_id) {
+    
+    // 1. Get the user's role first
+    $stmt_role = $conn->prepare("SELECT user_role FROM tbl_users WHERE user_id = ?");
+    $stmt_role->bind_param("i", $user_id);
+    $stmt_role->execute();
+    $result_role = $stmt_role->get_result();
+
+    if ($result_role->num_rows === 0) {
+        http_response_code(404);
+        echo json_encode(["error" => "User ID $user_id not found in user service data."]);
+        return;
+    }
+    
+    $user = $result_role->fetch_assoc();
+    $role = $user['user_role'];
+    $schedule_table = "tbl_{$role}_schedules";
+    
+    // 2. Prepare the main schedule query
+    $sql = "
+        SELECT 
+            s.schedule_time, 
+            s.schedule_day, 
+            s.schedule_date, 
+            c.course_id, 
+            c.course_name, 
+            c.units,
+            ? AS user_role
+        FROM $schedule_table s
+        JOIN tbl_courses c ON s.course_id = c.course_id
+        WHERE s.user_id = ?
+        ORDER BY s.schedule_day, s.schedule_time
+    ";
+    
+    $stmt_schedule = $conn->prepare($sql);
+    $stmt_schedule->bind_param("si", $role, $user_id);
+    $stmt_schedule->execute();
+    $result_schedule = $stmt_schedule->get_result();
+    
+    if ($result_schedule) {
+        $schedule = [];
+        while($row = $result_schedule->fetch_assoc()) {
+            $schedule[] = $row;
+        }
+        http_response_code(200);
+        echo json_encode($schedule);
+    } else {
+        http_response_code(500);
+        echo json_encode(["error" => "Error retrieving schedule: " . $conn->error]);
+    }
+}
+
+/**
+ * Handles POST /courses/{user_id}/schedules
+ * Creates a new schedule entry for a specific user (based on role).
+ */
+function handle_create_schedule($conn, $user_id) {
+    $data = json_decode(file_get_contents("php://input"), true);
+
+    // 1. Validate required schedule data
+    $course_id = $data['course_id'] ?? null;
+    $schedule_time = $data['schedule_time'] ?? null;
+    $schedule_day = $data['schedule_day'] ?? null;
+
+    if (!$course_id || !$schedule_time || !$schedule_day) {
+        http_response_code(400); 
+        echo json_encode(["error" => "Missing required fields: course_id, schedule_time, schedule_day."]);
+        return;
+    }
+    
+    // 2. Determine the user's role to select the correct table
+    $stmt_role = $conn->prepare("SELECT user_role FROM tbl_users WHERE user_id = ?");
+    $stmt_role->bind_param("i", $user_id);
+    $stmt_role->execute();
+    $result_role = $stmt_role->get_result();
+
+    if ($result_role->num_rows === 0) {
+        http_response_code(404);
+        echo json_encode(["error" => "User ID $user_id not found. Cannot assign schedule."]);
+        return;
+    }
+    
+    $user = $result_role->fetch_assoc();
+    $role = $user['user_role'];
+    $schedule_table = "tbl_{$role}_schedules";
+    $id_field = "{$role}_schedule_id";
+
+    // 3. Insert into the correct schedule table
+    $sql = "INSERT INTO $schedule_table (course_id, user_id, schedule_time, schedule_day) VALUES (?, ?, ?, ?)";
+    $stmt_insert = $conn->prepare($sql);
+    $stmt_insert->bind_param("iiss", $course_id, $user_id, $schedule_time, $schedule_day); 
+
+    if ($stmt_insert->execute()) {
+        http_response_code(201); // 201 Created
+        echo json_encode([
+            "message" => "Schedule created successfully for $role (User ID: $user_id)",
+            "schedule_id" => $conn->insert_id,
+            "course_id" => $course_id,
+            "user_role" => $role
+        ]);
+    } else {
+        http_response_code(500);
+        echo json_encode(["error" => "Failed to create schedule: " . $stmt_insert->error]);
     }
 }
 ?>

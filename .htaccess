@@ -1,7 +1,7 @@
 # Enable the Rewrite Engine
 RewriteEngine On
 
-# Define the base directory
+# Define the base directory for subdirectory installation
 RewriteBase /course-service/
 
 # Check if the requested file/path actually exists as a physical file on the server
