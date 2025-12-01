@@ -342,6 +342,7 @@ function handle_create_schedule($conn, $user_id) {
     $course_id = $data['course_id'] ?? null;
     $schedule_time = $data['schedule_time'] ?? null;
     $schedule_day = $data['schedule_day'] ?? null;
+    $schedule_date = $data['schedule_date'] ?? null;
 
     if (!$course_id || !$schedule_time || !$schedule_day) {
         http_response_code(400); 
@@ -366,19 +367,31 @@ function handle_create_schedule($conn, $user_id) {
     $schedule_table = "tbl_{$role}_schedules";
     $id_field = "{$role}_schedule_id";
 
-    // 3. Insert into the correct schedule table
-    $sql = "INSERT INTO $schedule_table (course_id, user_id, schedule_time, schedule_day) VALUES (?, ?, ?, ?)";
-    $stmt_insert = $conn->prepare($sql);
-    $stmt_insert->bind_param("iiss", $course_id, $user_id, $schedule_time, $schedule_day); 
+    // 3. Insert into the correct schedule table (including schedule_date if provided)
+    if ($schedule_date) {
+        $sql = "INSERT INTO $schedule_table (course_id, user_id, schedule_time, schedule_day, schedule_date) VALUES (?, ?, ?, ?, ?)";
+        $stmt_insert = $conn->prepare($sql);
+        $stmt_insert->bind_param("iisss", $course_id, $user_id, $schedule_time, $schedule_day, $schedule_date);
+    } else {
+        $sql = "INSERT INTO $schedule_table (course_id, user_id, schedule_time, schedule_day) VALUES (?, ?, ?, ?)";
+        $stmt_insert = $conn->prepare($sql);
+        $stmt_insert->bind_param("iiss", $course_id, $user_id, $schedule_time, $schedule_day);
+    } 
 
     if ($stmt_insert->execute()) {
         http_response_code(201); // 201 Created
-        echo json_encode([
+        $response = [
             "message" => "Schedule created successfully for $role (User ID: $user_id)",
             "schedule_id" => $conn->insert_id,
             "course_id" => $course_id,
+            "schedule_time" => $schedule_time,
+            "schedule_day" => $schedule_day,
             "user_role" => $role
-        ]);
+        ];
+        if ($schedule_date) {
+            $response["schedule_date"] = $schedule_date;
+        }
+        echo json_encode($response);
     } else {
         http_response_code(500);
         echo json_encode(["error" => "Failed to create schedule: " . $stmt_insert->error]);
