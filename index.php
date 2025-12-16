@@ -7,7 +7,7 @@
 // !!! IMPORTANT: CHANGE THESE DATABASE CREDENTIALS !!!
 define('DB_HOST', 'localhost');
 define('DB_USER', 'root');
-define('DB_PASS', ''); // <-- UPDATE THIS
+define('DB_PASS', ''); // <-- Your Password
 define('DB_NAME', 'course_db');
 
 // Set the API base URL for internal routing (assuming /api/v1 is the start)
@@ -37,11 +37,18 @@ if ($conn->connect_error) {
 
 // 4. ROUTING LOGIC
 $request_method = $_SERVER['REQUEST_METHOD'];
+
+// --- [ADDED] METHOD SPOOFING FOR INFINITYFREE ---
+// This fixes the 404 error on PUT requests by checking for ?_method=PUT
+if ($request_method === 'POST' && isset($_GET['_method'])) {
+    $request_method = strtoupper($_GET['_method']);
+}
+// ------------------------------------------------
+
 $uri = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
 
 // Extract resource and parameters from URI
-// Expected format: /course-service/api/v1/courses or /course-service/api/v1/courses/123
-// We need to get everything after /api/v1/
+// Expected format: /api/v1/courses or /api/v1/courses/123
 $parts = explode('/', $uri);
 
 // Find the position of 'api' in the parts
@@ -70,7 +77,7 @@ if ($resource === 'courses') {
         if ($request_method === 'GET') {
             handle_get_user_schedule($conn, $id);
         } else if ($request_method === 'POST') {
-            handle_create_schedule($conn, $id); // ID is the user_id here
+            handle_create_schedule($conn, $id); 
         } else {
             http_response_code(405);
             echo json_encode(["error" => "Method not allowed for /courses/{user_id}/schedules"]);
@@ -123,7 +130,6 @@ $conn->close();
  * Handles GET /courses and GET /courses?department={name}
  */
 function handle_get_all_courses($conn) {
-    // Check for the 'department' query parameter
     $department = $_GET['department'] ?? null;
     $sql = "SELECT course_id, course_name, units, departments FROM tbl_courses";
     $params = [];
@@ -179,7 +185,7 @@ function handle_get_single_course($conn, $id) {
 
 /**
  * Handles POST /courses
- * Creates a new course in tbl_courses.
+ * Creates a new course AND adds prerequisites if provided.
  */
 function handle_create_course($conn) {
     $data = json_decode(file_get_contents("php://input"), true);
@@ -187,32 +193,61 @@ function handle_create_course($conn) {
     $course_name = $data['course_name'] ?? null;
     $units = $data['units'] ?? null;
     $departments = $data['departments'] ?? null;
+    $prerequisites = $data['prerequisites'] ?? []; // New field
 
     if (!$course_name || !is_numeric($units) || !$departments) {
-        http_response_code(400); // Bad Request
-        echo json_encode(["error" => "Missing or invalid data: course_name, units (number), and departments are required."]);
+        http_response_code(400); 
+        echo json_encode(["error" => "Missing or invalid data: course_name, units, and departments are required."]);
         return;
     }
 
-    $stmt = $conn->prepare("INSERT INTO tbl_courses (course_name, units, departments) VALUES (?, ?, ?)");
-    $stmt->bind_param("sis", $course_name, $units, $departments);
+    // 1. Start Transaction
+    $conn->begin_transaction();
 
-    if ($stmt->execute()) {
-        http_response_code(201); // 201 Created
+    try {
+        // 2. Insert Course
+        $stmt = $conn->prepare("INSERT INTO tbl_courses (course_name, units, departments) VALUES (?, ?, ?)");
+        $stmt->bind_param("sis", $course_name, $units, $departments);
+
+        if (!$stmt->execute()) {
+            throw new Exception("Course insertion failed: " . $stmt->error);
+        }
+        
+        $new_course_id = $conn->insert_id;
+
+        // 3. Insert Prerequisites
+        if (!empty($prerequisites) && is_array($prerequisites)) {
+            $stmt_prereq = $conn->prepare("INSERT INTO tbl_courses_prerequisites (course_id, prerequisite_id) VALUES (?, ?)");
+            foreach ($prerequisites as $prereq_id) {
+                if (is_numeric($prereq_id)) {
+                    $stmt_prereq->bind_param("ii", $new_course_id, $prereq_id);
+                    if (!$stmt_prereq->execute()) {
+                         throw new Exception("Failed to add prerequisite ID: $prereq_id");
+                    }
+                }
+            }
+        }
+
+        // 4. Commit
+        $conn->commit();
+
+        http_response_code(201);
         echo json_encode([
             "message" => "Course created successfully",
-            "course_id" => $conn->insert_id,
-            "course_name" => $course_name
+            "course_id" => $new_course_id,
+            "course_name" => $course_name,
+            "prerequisites_count" => count($prerequisites)
         ]);
-    } else {
+
+    } catch (Exception $e) {
+        $conn->rollback();
         http_response_code(500);
-        echo json_encode(["error" => "Failed to create course: " . $stmt->error]);
+        echo json_encode(["error" => "Transaction failed: " . $e->getMessage()]);
     }
 }
 
 /**
  * Handles PUT /courses/{course_id}
- * Updates an existing course in tbl_courses.
  */
 function handle_update_course($conn, $course_id) {
     $data = json_decode(file_get_contents("php://input"), true);
@@ -223,7 +258,6 @@ function handle_update_course($conn, $course_id) {
         return;
     }
 
-    // Build the dynamic update query
     $set_clauses = [];
     $params = [];
     $types = '';
@@ -246,13 +280,12 @@ function handle_update_course($conn, $course_id) {
 
     if (empty($set_clauses)) {
         http_response_code(400);
-        echo json_encode(["error" => "No valid fields to update (requires course_name, units, or departments)."]);
+        echo json_encode(["error" => "No valid fields to update."]);
         return;
     }
 
     $sql = "UPDATE tbl_courses SET " . implode(', ', $set_clauses) . " WHERE course_id = ?";
     
-    // Add the course_id to the parameters and its type (integer)
     $params[] = $course_id;
     $types .= 'i';
 
@@ -260,15 +293,8 @@ function handle_update_course($conn, $course_id) {
     $stmt->bind_param($types, ...$params);
 
     if ($stmt->execute()) {
-        if ($stmt->affected_rows === 0) {
-            // Could be 404 (not found) or 200 (no changes needed)
-            handle_get_single_course($conn, $course_id); // Check if it exists before saying 200/404
-            return;
-        }
-        http_response_code(200); // OK
-        echo json_encode([
-            "message" => "Course ID $course_id updated successfully."
-        ]);
+        http_response_code(200); 
+        echo json_encode(["message" => "Course ID $course_id updated successfully."]);
     } else {
         http_response_code(500);
         echo json_encode(["error" => "Failed to update course: " . $stmt->error]);
@@ -280,8 +306,6 @@ function handle_update_course($conn, $course_id) {
  * Handles GET /courses/{user_id}/schedules
  */
 function handle_get_user_schedule($conn, $user_id) {
-    
-    // 1. Get the user's role first
     $stmt_role = $conn->prepare("SELECT user_role FROM tbl_users WHERE user_id = ?");
     $stmt_role->bind_param("i", $user_id);
     $stmt_role->execute();
@@ -289,7 +313,7 @@ function handle_get_user_schedule($conn, $user_id) {
 
     if ($result_role->num_rows === 0) {
         http_response_code(404);
-        echo json_encode(["error" => "User ID $user_id not found in user service data."]);
+        echo json_encode(["error" => "User ID $user_id not found."]);
         return;
     }
     
@@ -297,7 +321,6 @@ function handle_get_user_schedule($conn, $user_id) {
     $role = $user['user_role'];
     $schedule_table = "tbl_{$role}_schedules";
     
-    // 2. Prepare the main schedule query
     $sql = "
         SELECT 
             s.schedule_time, 
@@ -333,12 +356,10 @@ function handle_get_user_schedule($conn, $user_id) {
 
 /**
  * Handles POST /courses/{user_id}/schedules
- * Creates a new schedule entry for a specific user (based on role).
  */
 function handle_create_schedule($conn, $user_id) {
     $data = json_decode(file_get_contents("php://input"), true);
 
-    // 1. Validate required schedule data
     $course_id = $data['course_id'] ?? null;
     $schedule_time = $data['schedule_time'] ?? null;
     $schedule_day = $data['schedule_day'] ?? null;
@@ -346,11 +367,10 @@ function handle_create_schedule($conn, $user_id) {
 
     if (!$course_id || !$schedule_time || !$schedule_day) {
         http_response_code(400); 
-        echo json_encode(["error" => "Missing required fields: course_id, schedule_time, schedule_day."]);
+        echo json_encode(["error" => "Missing required fields."]);
         return;
     }
     
-    // 2. Determine the user's role to select the correct table
     $stmt_role = $conn->prepare("SELECT user_role FROM tbl_users WHERE user_id = ?");
     $stmt_role->bind_param("i", $user_id);
     $stmt_role->execute();
@@ -358,16 +378,14 @@ function handle_create_schedule($conn, $user_id) {
 
     if ($result_role->num_rows === 0) {
         http_response_code(404);
-        echo json_encode(["error" => "User ID $user_id not found. Cannot assign schedule."]);
+        echo json_encode(["error" => "User ID $user_id not found."]);
         return;
     }
     
     $user = $result_role->fetch_assoc();
     $role = $user['user_role'];
     $schedule_table = "tbl_{$role}_schedules";
-    $id_field = "{$role}_schedule_id";
 
-    // 3. Insert into the correct schedule table (including schedule_date if provided)
     if ($schedule_date) {
         $sql = "INSERT INTO $schedule_table (course_id, user_id, schedule_time, schedule_day, schedule_date) VALUES (?, ?, ?, ?, ?)";
         $stmt_insert = $conn->prepare($sql);
@@ -379,18 +397,13 @@ function handle_create_schedule($conn, $user_id) {
     } 
 
     if ($stmt_insert->execute()) {
-        http_response_code(201); // 201 Created
+        http_response_code(201);
         $response = [
-            "message" => "Schedule created successfully for $role (User ID: $user_id)",
+            "message" => "Schedule created successfully for $role",
             "schedule_id" => $conn->insert_id,
-            "course_id" => $course_id,
-            "schedule_time" => $schedule_time,
-            "schedule_day" => $schedule_day,
-            "user_role" => $role
+            "course_id" => $course_id
         ];
-        if ($schedule_date) {
-            $response["schedule_date"] = $schedule_date;
-        }
+        if ($schedule_date) $response["schedule_date"] = $schedule_date;
         echo json_encode($response);
     } else {
         http_response_code(500);
